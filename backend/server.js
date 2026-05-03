@@ -21,6 +21,7 @@ app.use(express.json());
 
 const db = new Database(path.join(__dirname, 'bills.db'));
 
+// 数据库表结构
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,6 +71,26 @@ db.exec(`
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES users(id)
   );
+`);
+
+// 创建查询索引 - 性能优化关键
+db.exec(`
+  -- 账单表索引
+  CREATE INDEX IF NOT EXISTS idx_bills_user ON bills(user_id);
+  CREATE INDEX IF NOT EXISTS idx_bills_date ON bills(date);
+  CREATE INDEX IF NOT EXISTS idx_bills_category ON bills(category);
+  CREATE INDEX IF NOT EXISTS idx_bills_user_date ON bills(user_id, date);
+  CREATE INDEX IF NOT EXISTS idx_bills_user_category ON bills(user_id, category);
+  CREATE INDEX IF NOT EXISTS idx_bills_user_date_category ON bills(user_id, date, category);
+  
+  -- 账户表索引
+  CREATE INDEX IF NOT EXISTS idx_accounts_user ON accounts(user_id);
+  
+  -- 预算表索引
+  CREATE INDEX IF NOT EXISTS idx_budgets_user ON budgets(user_id);
+  
+  -- 规则表索引
+  CREATE INDEX IF NOT EXISTS idx_rules_user ON rules(user_id);
 `);
 
 const authMiddleware = (req, res, next) => {
@@ -161,8 +182,11 @@ app.delete('/api/accounts/:id', authMiddleware, (req, res) => {
   res.json({ success: true });
 });
 
+// 分页账单查询
 app.get('/api/bills', authMiddleware, (req, res) => {
-  const { startDate, endDate, category, accountId } = req.query;
+  const { startDate, endDate, category, accountId, page = 1, limit = 50 } = req.query;
+  const offset = (parseInt(page) - 1) * parseInt(limit);
+  
   let query = 'SELECT * FROM bills WHERE user_id = ?';
   const params = [req.userId];
   
@@ -183,10 +207,25 @@ app.get('/api/bills', authMiddleware, (req, res) => {
     params.push(accountId);
   }
   
-  query += ' ORDER BY date DESC';
+  // 获取总条数
+  const countQuery = query.replace('SELECT *', 'SELECT COUNT(*) as total');
+  const countStmt = db.prepare(countQuery);
+  const { total } = countStmt.get(...params);
+  
+  // 获取分页数据
+  query += ' ORDER BY date DESC LIMIT ? OFFSET ?';
+  params.push(parseInt(limit), offset);
+  
   const stmt = db.prepare(query);
   const bills = stmt.all(...params);
-  res.json(bills);
+  
+  res.json({
+    bills,
+    total,
+    page: parseInt(page),
+    limit: parseInt(limit),
+    totalPages: Math.ceil(total / parseInt(limit))
+  });
 });
 
 app.post('/api/bills', authMiddleware, async (req, res) => {
@@ -259,6 +298,150 @@ app.delete('/api/bills/:id', authMiddleware, (req, res) => {
   res.json({ success: true });
 });
 
+// ===== 性能优化：新增聚合统计接口 =====
+
+// 获取月份列表（用于图表选择）
+app.get('/api/stats/months', authMiddleware, (req, res) => {
+  const stmt = db.prepare(`
+    SELECT DISTINCT SUBSTR(date, 1, 7) as month
+    FROM bills
+    WHERE user_id = ?
+    ORDER BY month DESC
+    LIMIT 24
+  `);
+  const months = stmt.all(req.userId);
+  res.json(months.map(m => m.month));
+});
+
+// 月份分类汇总数据（饼图）
+app.get('/api/stats/category-summary', authMiddleware, (req, res) => {
+  const { month } = req.query;
+  const targetMonth = month || new Date().toISOString().slice(0, 7);
+  const startDate = targetMonth + '-01';
+  const endDate = targetMonth + '-31';
+  
+  const stmt = db.prepare(`
+    SELECT 
+      category,
+      SUM(CASE WHEN amount < 0 THEN amount ELSE 0 END) as expense,
+      SUM(CASE WHEN amount >= 0 THEN amount ELSE 0 END) as income,
+      COUNT(*) as count
+    FROM bills
+    WHERE user_id = ? AND date >= ? AND date <= ?
+    GROUP BY category
+    ORDER BY expense ASC
+  `);
+  
+  const summary = stmt.all(req.userId, startDate, endDate);
+  res.json({ month: targetMonth, data: summary });
+});
+
+// 每日汇总数据（折线图）
+app.get('/api/stats/daily-summary', authMiddleware, (req, res) => {
+  const { month } = req.query;
+  const targetMonth = month || new Date().toISOString().slice(0, 7);
+  const startDate = targetMonth + '-01';
+  const endDate = targetMonth + '-31';
+  
+  const stmt = db.prepare(`
+    SELECT 
+      date,
+      SUM(CASE WHEN amount < 0 THEN amount ELSE 0 END) as expense,
+      SUM(CASE WHEN amount >= 0 THEN amount ELSE 0 END) as income,
+      COUNT(*) as count
+    FROM bills
+    WHERE user_id = ? AND date >= ? AND date <= ?
+    GROUP BY date
+    ORDER BY date
+  `);
+  
+  const daily = stmt.all(req.userId, startDate, endDate);
+  res.json({ month: targetMonth, data: daily });
+});
+
+// 按月趋势数据（年度折线图）
+app.get('/api/stats/monthly-trend', authMiddleware, (req, res) => {
+  const { year } = req.query;
+  const targetYear = year || new Date().getFullYear();
+  
+  const stmt = db.prepare(`
+    SELECT 
+      SUBSTR(date, 1, 7) as month,
+      SUM(CASE WHEN amount < 0 THEN amount ELSE 0 END) as expense,
+      SUM(CASE WHEN amount >= 0 THEN amount ELSE 0 END) as income
+    FROM bills
+    WHERE user_id = ? AND SUBSTR(date, 1, 4) = ?
+    GROUP BY SUBSTR(date, 1, 7)
+    ORDER BY month
+  `);
+  
+  const trend = stmt.all(req.userId, targetYear.toString());
+  res.json({ year: targetYear, data: trend });
+});
+
+// 优化后的仪表盘统计接口
+app.get('/api/dashboard', authMiddleware, (req, res) => {
+  const currentMonth = new Date().toISOString().slice(0, 7);
+  const startDate = currentMonth + '-01';
+  const endDate = currentMonth + '-31';
+  
+  // 分类汇总
+  const categoryStmt = db.prepare(`
+    SELECT 
+      category, 
+      SUM(amount) as total, 
+      COUNT(*) as count
+    FROM bills
+    WHERE user_id = ? AND date >= ? AND date <= ?
+    GROUP BY category
+  `);
+  const categoryData = categoryStmt.all(req.userId, startDate, endDate);
+  
+  // 每日汇总
+  const dailyStmt = db.prepare(`
+    SELECT date, SUM(amount) as total
+    FROM bills
+    WHERE user_id = ? AND date >= ? AND date <= ?
+    GROUP BY date
+    ORDER BY date
+  `);
+  const dailyData = dailyStmt.all(req.userId, startDate, endDate);
+  
+  // 账户数据
+  const accountStmt = db.prepare('SELECT name, type, balance FROM accounts WHERE user_id = ?');
+  const accounts = accountStmt.all(req.userId);
+  
+  // 预算状态（快速查询）
+  const budgetStmt = db.prepare('SELECT * FROM budgets WHERE user_id = ?');
+  const budgets = budgetStmt.all(req.userId);
+  
+  const spentStmt = db.prepare(`
+    SELECT category, SUM(amount) as spent 
+    FROM bills 
+    WHERE user_id = ? AND date >= ? AND date <= ? AND amount < 0
+    GROUP BY category
+  `);
+  const spentList = spentStmt.all(req.userId, startDate, endDate);
+  const spentMap = {};
+  spentList.forEach(s => spentMap[s.category] = Math.abs(s.spent));
+  
+  const budgetStatus = budgets.map(b => ({
+    category: b.category,
+    budget: b.amount,
+    spent: spentMap[b.category] || 0,
+    remaining: b.amount - (spentMap[b.category] || 0),
+    exceeded: (spentMap[b.category] || 0) > b.amount
+  }));
+  
+  res.json({
+    categoryData,
+    dailyData,
+    accounts,
+    budgetStatus,
+    currentMonth
+  });
+});
+
 app.get('/api/budgets', authMiddleware, (req, res) => {
   const stmt = db.prepare('SELECT * FROM budgets WHERE user_id = ?');
   const budgets = stmt.all(req.userId);
@@ -318,39 +501,6 @@ app.delete('/api/rules/:id', authMiddleware, (req, res) => {
   const stmt = db.prepare('DELETE FROM rules WHERE id = ? AND user_id = ?');
   stmt.run(req.params.id, req.userId);
   res.json({ success: true });
-});
-
-app.get('/api/dashboard', authMiddleware, (req, res) => {
-  const currentMonth = new Date().toISOString().slice(0, 7);
-  const startDate = currentMonth + '-01';
-  const endDate = currentMonth + '-31';
-  
-  const billStmt = db.prepare(`
-    SELECT category, SUM(amount) as total, COUNT(*) as count
-    FROM bills
-    WHERE user_id = ? AND date >= ? AND date <= ?
-    GROUP BY category
-  `);
-  const categoryData = billStmt.all(req.userId, startDate, endDate);
-  
-  const dailyStmt = db.prepare(`
-    SELECT date, SUM(amount) as total
-    FROM bills
-    WHERE user_id = ? AND date >= ? AND date <= ?
-    GROUP BY date
-    ORDER BY date
-  `);
-  const dailyData = dailyStmt.all(req.userId, startDate, endDate);
-  
-  const accountStmt = db.prepare('SELECT name, type, balance FROM accounts WHERE user_id = ?');
-  const accounts = accountStmt.all(req.userId);
-  
-  res.json({
-    categoryData,
-    dailyData,
-    accounts,
-    currentMonth
-  });
 });
 
 app.get('/api/export/pdf', authMiddleware, async (req, res) => {
