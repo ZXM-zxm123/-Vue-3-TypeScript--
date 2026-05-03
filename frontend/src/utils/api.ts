@@ -6,7 +6,11 @@ import type {
   Budget,
   BudgetStatus,
   Rule,
-  DashboardData
+  DashboardData,
+  CategorySummaryResponse,
+  DailySummaryResponse,
+  MonthlyTrendResponse,
+  PaginatedBillsResponse
 } from '../types';
 
 const api = axios.create({
@@ -41,8 +45,14 @@ export const accountAPI = {
 };
 
 export const billAPI = {
-  getAll: (params?: { startDate?: string; endDate?: string; category?: string; accountId?: number }) =>
-    api.get<Bill[]>('/bills', { params }),
+  getAll: (params?: {
+    startDate?: string;
+    endDate?: string;
+    category?: string;
+    accountId?: number;
+    page?: number;
+    limit?: number;
+  }) => api.get<PaginatedBillsResponse>('/bills', { params }),
   create: (data: { amount: number; description: string; category?: string; date: string; accountId: number }) =>
     api.post<Bill>('/bills', data),
   upload: (formData: FormData) =>
@@ -72,6 +82,26 @@ export const dashboardAPI = {
 
 export const exportAPI = {
   exportPDF: () => api.get('/export/pdf', { responseType: 'blob' })
+};
+
+// ===== 新增的统计 API =====
+export const statsAPI = {
+  getMonths: () => api.get<string[]>('/stats/months'),
+  
+  getCategorySummary: (month?: string) =>
+    api.get<CategorySummaryResponse>('/stats/category-summary', {
+      params: month ? { month } : {}
+    }),
+  
+  getDailySummary: (month?: string) =>
+    api.get<DailySummaryResponse>('/stats/daily-summary', {
+      params: month ? { month } : {}
+    }),
+  
+  getMonthlyTrend: (year?: number) =>
+    api.get<MonthlyTrendResponse>('/stats/monthly-trend', {
+      params: year ? { year } : {}
+    })
 };
 
 export default api;
