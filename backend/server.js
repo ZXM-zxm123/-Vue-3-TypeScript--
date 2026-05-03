@@ -7,26 +7,46 @@ import multer from 'multer';
 import { parse } from 'csv-parse/sync';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+import { initEncryption, isEncryptionReady, encrypt, decrypt, encryptObject, decryptObject } from './utils/crypto.js';
+
+// 加载环境变量
+try {
+  const { config } = await import('dotenv');
+  config({ path: join(dirname(fileURLToPath(import.meta.url)), '.env') });
+} catch (e) {
+  // dotenv optional
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = 3001;
-const JWT_SECRET = 'bill-manager-secret-key-2024';
-const PYTHON_SERVICE_URL = 'http://localhost:5001';
+const PORT = process.env.PORT || 3001;
+const JWT_SECRET = process.env.JWT_SECRET || 'bill-manager-secret-key-2024';
+const PYTHON_SERVICE_URL = process.env.PYTHON_SERVICE_URL || 'http://localhost:5001';
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
 
 app.use(cors());
 app.use(express.json());
 
+if (!ENCRYPTION_KEY) {
+  console.warn('WARNING: ENCRYPTION_KEY not set. Using default key for development only!');
+  console.warn('Set ENCRYPTION_KEY environment variable for production!');
+  initEncryption('development-default-key-please-change-in-production');
+} else {
+  initEncryption(ENCRYPTION_KEY);
+  console.log('Encryption initialized successfully');
+}
+
 const db = new Database(path.join(__dirname, 'bills.db'));
 
-// 数据库表结构
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT UNIQUE NOT NULL,
     password TEXT NOT NULL,
+    encryption_key_id INTEGER DEFAULT 1,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 
@@ -73,30 +93,22 @@ db.exec(`
   );
 `);
 
-// 创建查询索引 - 性能优化关键
 db.exec(`
-  -- 账单表索引
   CREATE INDEX IF NOT EXISTS idx_bills_user ON bills(user_id);
   CREATE INDEX IF NOT EXISTS idx_bills_date ON bills(date);
   CREATE INDEX IF NOT EXISTS idx_bills_category ON bills(category);
   CREATE INDEX IF NOT EXISTS idx_bills_user_date ON bills(user_id, date);
   CREATE INDEX IF NOT EXISTS idx_bills_user_category ON bills(user_id, category);
   CREATE INDEX IF NOT EXISTS idx_bills_user_date_category ON bills(user_id, date, category);
-  
-  -- 账户表索引
   CREATE INDEX IF NOT EXISTS idx_accounts_user ON accounts(user_id);
-  
-  -- 预算表索引
   CREATE INDEX IF NOT EXISTS idx_budgets_user ON budgets(user_id);
-  
-  -- 规则表索引
   CREATE INDEX IF NOT EXISTS idx_rules_user ON rules(user_id);
 `);
 
 const authMiddleware = (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'No token provided' });
-  
+
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     req.userId = decoded.userId;
@@ -126,17 +138,21 @@ const fetchPythonClassify = async (description) => {
   return '其他';
 };
 
+const SENSITIVE_BILL_FIELDS = ['description', 'category'];
+const SENSITIVE_ACCOUNT_FIELDS = ['name'];
+const SENSITIVE_RULE_FIELDS = ['keyword', 'category'];
+
 app.post('/api/register', async (req, res) => {
   const { username, password } = req.body;
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
     const stmt = db.prepare('INSERT INTO users (username, password) VALUES (?, ?)');
     const result = stmt.run(username, hashedPassword);
-    
+
     const userStmt = db.prepare('INSERT INTO accounts (user_id, name, type, balance) VALUES (?, ?, ?, ?)');
-    userStmt.run(result.lastInsertRowid, '现金账户', 'cash', 0);
-    userStmt.run(result.lastInsertRowid, '信用卡', 'credit_card', 0);
-    
+    userStmt.run(result.lastInsertRowid, encrypt('现金账户'), 'cash', 0);
+    userStmt.run(result.lastInsertRowid, encrypt('信用卡'), 'credit_card', 0);
+
     res.json({ id: result.lastInsertRowid, username });
   } catch (err) {
     res.status(400).json({ error: 'Username already exists' });
@@ -147,11 +163,11 @@ app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
   const stmt = db.prepare('SELECT * FROM users WHERE username = ?');
   const user = stmt.get(username);
-  
+
   if (!user || !(await bcrypt.compare(password, user.password))) {
     return res.status(401).json({ error: 'Invalid credentials' });
   }
-  
+
   const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
   res.json({ token, userId: user.id, username: user.username });
 });
@@ -159,20 +175,34 @@ app.post('/api/login', async (req, res) => {
 app.get('/api/accounts', authMiddleware, (req, res) => {
   const stmt = db.prepare('SELECT * FROM accounts WHERE user_id = ?');
   const accounts = stmt.all(req.userId);
-  res.json(accounts);
+
+  const decryptedAccounts = accounts.map(account => {
+    if (account.name && account.name.includes(':')) {
+      try {
+        account.name = decrypt(account.name);
+      } catch (e) {
+        // Already decrypted or not encrypted
+      }
+    }
+    return account;
+  });
+
+  res.json(decryptedAccounts);
 });
 
 app.post('/api/accounts', authMiddleware, (req, res) => {
   const { name, type, balance } = req.body;
+  const encryptedName = encrypt(name);
   const stmt = db.prepare('INSERT INTO accounts (user_id, name, type, balance) VALUES (?, ?, ?, ?)');
-  const result = stmt.run(req.userId, name, type, balance || 0);
+  const result = stmt.run(req.userId, encryptedName, type, balance || 0);
   res.json({ id: result.lastInsertRowid, name, type, balance: balance || 0 });
 });
 
 app.put('/api/accounts/:id', authMiddleware, (req, res) => {
   const { name, type, balance } = req.body;
+  const encryptedName = encrypt(name);
   const stmt = db.prepare('UPDATE accounts SET name = ?, type = ?, balance = ? WHERE id = ? AND user_id = ?');
-  stmt.run(name, type, balance, req.params.id, req.userId);
+  stmt.run(encryptedName, type, balance, req.params.id, req.userId);
   res.json({ id: parseInt(req.params.id), name, type, balance });
 });
 
@@ -182,14 +212,13 @@ app.delete('/api/accounts/:id', authMiddleware, (req, res) => {
   res.json({ success: true });
 });
 
-// 分页账单查询
 app.get('/api/bills', authMiddleware, (req, res) => {
   const { startDate, endDate, category, accountId, page = 1, limit = 50 } = req.query;
   const offset = (parseInt(page) - 1) * parseInt(limit);
-  
+
   let query = 'SELECT * FROM bills WHERE user_id = ?';
   const params = [req.userId];
-  
+
   if (startDate) {
     query += ' AND date >= ?';
     params.push(startDate);
@@ -206,21 +235,23 @@ app.get('/api/bills', authMiddleware, (req, res) => {
     query += ' AND account_id = ?';
     params.push(accountId);
   }
-  
-  // 获取总条数
+
   const countQuery = query.replace('SELECT *', 'SELECT COUNT(*) as total');
   const countStmt = db.prepare(countQuery);
   const { total } = countStmt.get(...params);
-  
-  // 获取分页数据
+
   query += ' ORDER BY date DESC LIMIT ? OFFSET ?';
   params.push(parseInt(limit), offset);
-  
+
   const stmt = db.prepare(query);
   const bills = stmt.all(...params);
-  
+
+  const decryptedBills = bills.map(bill => {
+    return decryptObject(bill, SENSITIVE_BILL_FIELDS);
+  });
+
   res.json({
-    bills,
+    bills: decryptedBills,
     total,
     page: parseInt(page),
     limit: parseInt(limit),
@@ -230,65 +261,71 @@ app.get('/api/bills', authMiddleware, (req, res) => {
 
 app.post('/api/bills', authMiddleware, async (req, res) => {
   const { amount, description, category, date, accountId } = req.body;
-  
+
   let finalCategory = category;
   if (!finalCategory || finalCategory === '待分类') {
     const ruleStmt = db.prepare('SELECT category FROM rules WHERE user_id = ? AND ? LIKE "%" || keyword || "%"');
     const rule = ruleStmt.get(req.userId, description);
     if (rule) {
-      finalCategory = rule.category;
+      finalCategory = decrypt(rule.category);
     } else {
       finalCategory = await fetchPythonClassify(description);
     }
   }
-  
+
+  const encryptedDescription = encrypt(description);
+  const encryptedCategory = encrypt(finalCategory);
+
   const stmt = db.prepare('INSERT INTO bills (user_id, account_id, amount, description, category, date) VALUES (?, ?, ?, ?, ?, ?)');
-  const result = stmt.run(req.userId, accountId, amount, description, finalCategory, date);
-  
+  const result = stmt.run(req.userId, accountId, amount, encryptedDescription, encryptedCategory, date);
+
   const accountStmt = db.prepare('UPDATE accounts SET balance = balance + ? WHERE id = ?');
   accountStmt.run(amount, accountId);
-  
+
   res.json({ id: result.lastInsertRowid, amount, description, category: finalCategory, date, accountId });
 });
 
 app.post('/api/bills/upload', authMiddleware, upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-  
+
   const text = req.file.buffer.toString('utf-8');
   let records;
-  
+
   try {
     records = parse(text, { columns: true, skip_empty_lines: true });
   } catch (err) {
     return res.status(400).json({ error: 'Invalid CSV format' });
   }
-  
+
   const insertStmt = db.prepare('INSERT INTO bills (user_id, account_id, amount, description, category, date) VALUES (?, ?, ?, ?, ?, ?)');
   const accountStmt = db.prepare('UPDATE accounts SET balance = balance + ? WHERE id = ?');
-  
+
   const results = [];
   for (const record of records) {
     const amount = parseFloat(record.amount) || 0;
     const description = record.description || record.desc || record.memo || '';
     const date = record.date || record.time || new Date().toISOString().split('T')[0];
     const accountId = parseInt(record.accountId) || 1;
-    
+
     let category = record.category || '待分类';
     if (category === '待分类') {
       const ruleStmt = db.prepare('SELECT category FROM rules WHERE user_id = ? AND ? LIKE "%" || keyword || "%"');
       const rule = ruleStmt.get(req.userId, description);
       if (rule) {
-        category = rule.category;
+        category = decrypt(rule.category);
       } else {
         category = await fetchPythonClassify(description);
       }
     }
-    
-    const result = insertStmt.run(req.userId, accountId, amount, description, category, date);
+
+    const encryptedDescription = encrypt(description);
+    const encryptedCategory = encrypt(category);
+
+    const result = insertStmt.run(req.userId, accountId, amount, encryptedDescription, encryptedCategory, date);
     accountStmt.run(amount, accountId);
     results.push({ id: result.lastInsertRowid, amount, description, category, date, accountId });
   }
-  
+
   res.json({ uploaded: results.length, bills: results });
 });
 
@@ -298,9 +335,6 @@ app.delete('/api/bills/:id', authMiddleware, (req, res) => {
   res.json({ success: true });
 });
 
-// ===== 性能优化：新增聚合统计接口 =====
-
-// 获取月份列表（用于图表选择）
 app.get('/api/stats/months', authMiddleware, (req, res) => {
   const stmt = db.prepare(`
     SELECT DISTINCT SUBSTR(date, 1, 7) as month
@@ -313,13 +347,12 @@ app.get('/api/stats/months', authMiddleware, (req, res) => {
   res.json(months.map(m => m.month));
 });
 
-// 月份分类汇总数据（饼图）
 app.get('/api/stats/category-summary', authMiddleware, (req, res) => {
   const { month } = req.query;
   const targetMonth = month || new Date().toISOString().slice(0, 7);
   const startDate = targetMonth + '-01';
   const endDate = targetMonth + '-31';
-  
+
   const stmt = db.prepare(`
     SELECT 
       category,
@@ -331,18 +364,23 @@ app.get('/api/stats/category-summary', authMiddleware, (req, res) => {
     GROUP BY category
     ORDER BY expense ASC
   `);
-  
+
   const summary = stmt.all(req.userId, startDate, endDate);
-  res.json({ month: targetMonth, data: summary });
+
+  const decryptedSummary = summary.map(item => ({
+    ...item,
+    category: decrypt(item.category)
+  }));
+
+  res.json({ month: targetMonth, data: decryptedSummary });
 });
 
-// 每日汇总数据（折线图）
 app.get('/api/stats/daily-summary', authMiddleware, (req, res) => {
   const { month } = req.query;
   const targetMonth = month || new Date().toISOString().slice(0, 7);
   const startDate = targetMonth + '-01';
   const endDate = targetMonth + '-31';
-  
+
   const stmt = db.prepare(`
     SELECT 
       date,
@@ -354,16 +392,15 @@ app.get('/api/stats/daily-summary', authMiddleware, (req, res) => {
     GROUP BY date
     ORDER BY date
   `);
-  
+
   const daily = stmt.all(req.userId, startDate, endDate);
   res.json({ month: targetMonth, data: daily });
 });
 
-// 按月趋势数据（年度折线图）
 app.get('/api/stats/monthly-trend', authMiddleware, (req, res) => {
   const { year } = req.query;
   const targetYear = year || new Date().getFullYear();
-  
+
   const stmt = db.prepare(`
     SELECT 
       SUBSTR(date, 1, 7) as month,
@@ -374,30 +411,32 @@ app.get('/api/stats/monthly-trend', authMiddleware, (req, res) => {
     GROUP BY SUBSTR(date, 1, 7)
     ORDER BY month
   `);
-  
+
   const trend = stmt.all(req.userId, targetYear.toString());
   res.json({ year: targetYear, data: trend });
 });
 
-// 优化后的仪表盘统计接口
 app.get('/api/dashboard', authMiddleware, (req, res) => {
   const currentMonth = new Date().toISOString().slice(0, 7);
   const startDate = currentMonth + '-01';
   const endDate = currentMonth + '-31';
-  
-  // 分类汇总
+
   const categoryStmt = db.prepare(`
-    SELECT 
-      category, 
-      SUM(amount) as total, 
+    SELECT
+      category,
+      SUM(amount) as total,
       COUNT(*) as count
     FROM bills
     WHERE user_id = ? AND date >= ? AND date <= ?
     GROUP BY category
   `);
   const categoryData = categoryStmt.all(req.userId, startDate, endDate);
-  
-  // 每日汇总
+
+  const decryptedCategoryData = categoryData.map(item => ({
+    ...item,
+    category: decrypt(item.category)
+  }));
+
   const dailyStmt = db.prepare(`
     SELECT date, SUM(amount) as total
     FROM bills
@@ -406,25 +445,38 @@ app.get('/api/dashboard', authMiddleware, (req, res) => {
     ORDER BY date
   `);
   const dailyData = dailyStmt.all(req.userId, startDate, endDate);
-  
-  // 账户数据
+
   const accountStmt = db.prepare('SELECT name, type, balance FROM accounts WHERE user_id = ?');
   const accounts = accountStmt.all(req.userId);
-  
-  // 预算状态（快速查询）
+
+  const decryptedAccounts = accounts.map(account => {
+    if (account.name && account.name.includes(':')) {
+      try {
+        account.name = decrypt(account.name);
+      } catch (e) {
+        // Already decrypted or not encrypted
+      }
+    }
+    return account;
+  });
+
   const budgetStmt = db.prepare('SELECT * FROM budgets WHERE user_id = ?');
   const budgets = budgetStmt.all(req.userId);
-  
+
   const spentStmt = db.prepare(`
-    SELECT category, SUM(amount) as spent 
-    FROM bills 
+    SELECT category, SUM(amount) as spent
+    FROM bills
     WHERE user_id = ? AND date >= ? AND date <= ? AND amount < 0
     GROUP BY category
   `);
   const spentList = spentStmt.all(req.userId, startDate, endDate);
+
   const spentMap = {};
-  spentList.forEach(s => spentMap[s.category] = Math.abs(s.spent));
-  
+  spentList.forEach(s => {
+    const decryptedCategory = decrypt(s.category);
+    spentMap[decryptedCategory] = Math.abs(s.spent);
+  });
+
   const budgetStatus = budgets.map(b => ({
     category: b.category,
     budget: b.amount,
@@ -432,11 +484,11 @@ app.get('/api/dashboard', authMiddleware, (req, res) => {
     remaining: b.amount - (spentMap[b.category] || 0),
     exceeded: (spentMap[b.category] || 0) > b.amount
   }));
-  
+
   res.json({
-    categoryData,
+    categoryData: decryptedCategoryData,
     dailyData,
-    accounts,
+    accounts: decryptedAccounts,
     budgetStatus,
     currentMonth
   });
@@ -450,8 +502,9 @@ app.get('/api/budgets', authMiddleware, (req, res) => {
 
 app.post('/api/budgets', authMiddleware, (req, res) => {
   const { category, amount, period } = req.body;
+  const encryptedCategory = encrypt(category);
   const stmt = db.prepare('INSERT INTO budgets (user_id, category, amount, period) VALUES (?, ?, ?, ?)');
-  const result = stmt.run(req.userId, category, amount, period || 'monthly');
+  const result = stmt.run(req.userId, encryptedCategory, amount, period || 'monthly');
   res.json({ id: result.lastInsertRowid, category, amount, period: period || 'monthly' });
 });
 
@@ -459,20 +512,23 @@ app.get('/api/budgets/status', authMiddleware, (req, res) => {
   const currentMonth = new Date().toISOString().slice(0, 7);
   const startDate = currentMonth + '-01';
   const endDate = currentMonth + '-31';
-  
+
   const budgetStmt = db.prepare('SELECT * FROM budgets WHERE user_id = ?');
   const budgets = budgetStmt.all(req.userId);
-  
+
   const billStmt = db.prepare(`
-    SELECT category, SUM(amount) as spent 
-    FROM bills 
+    SELECT category, SUM(amount) as spent
+    FROM bills
     WHERE user_id = ? AND date >= ? AND date <= ? AND amount < 0
     GROUP BY category
   `);
   const spent = billStmt.all(req.userId, startDate, endDate);
   const spentMap = {};
-  spent.forEach(s => spentMap[s.category] = Math.abs(s.spent));
-  
+  spent.forEach(s => {
+    const decryptedCategory = decrypt(s.category);
+    spentMap[decryptedCategory] = Math.abs(s.spent);
+  });
+
   const status = budgets.map(b => ({
     category: b.category,
     budget: b.amount,
@@ -480,20 +536,27 @@ app.get('/api/budgets/status', authMiddleware, (req, res) => {
     remaining: b.amount - (spentMap[b.category] || 0),
     exceeded: (spentMap[b.category] || 0) > b.amount
   }));
-  
+
   res.json(status);
 });
 
 app.get('/api/rules', authMiddleware, (req, res) => {
   const stmt = db.prepare('SELECT * FROM rules WHERE user_id = ?');
   const rules = stmt.all(req.userId);
-  res.json(rules);
+
+  const decryptedRules = rules.map(rule => {
+    return decryptObject(rule, SENSITIVE_RULE_FIELDS);
+  });
+
+  res.json(decryptedRules);
 });
 
 app.post('/api/rules', authMiddleware, (req, res) => {
   const { keyword, category } = req.body;
-  const stmt = db.prepare('INSERT INTO rules (user_id, keyword, category) VALUES (?, ?, ?)');
-  const result = stmt.run(req.userId, keyword, category);
+  const encryptedKeyword = encrypt(keyword);
+  const encryptedCategory = encrypt(category);
+  const stmt = db.prepare('INSERT INTO rules (user_id, keyword, category) VALUES (?, ?, ?, ?)');
+  const result = stmt.run(req.userId, encryptedKeyword, encryptedCategory);
   res.json({ id: result.lastInsertRowid, keyword, category });
 });
 
@@ -507,7 +570,7 @@ app.get('/api/export/pdf', authMiddleware, async (req, res) => {
   const currentMonth = new Date().toISOString().slice(0, 7);
   const startDate = currentMonth + '-01';
   const endDate = currentMonth + '-31';
-  
+
   const billStmt = db.prepare(`
     SELECT b.*, a.name as account_name
     FROM bills b
@@ -516,10 +579,22 @@ app.get('/api/export/pdf', authMiddleware, async (req, res) => {
     ORDER BY b.date DESC
   `);
   const bills = billStmt.all(req.userId, startDate, endDate);
-  
+
+  const decryptedBills = bills.map(bill => {
+    const decrypted = decryptObject(bill, SENSITIVE_BILL_FIELDS);
+    if (decrypted.account_name) {
+      try {
+        decrypted.account_name = decrypt(decrypted.account_name);
+      } catch (e) {
+        // Already decrypted or not encrypted
+      }
+    }
+    return decrypted;
+  });
+
   const budgetStmt = db.prepare('SELECT * FROM budgets WHERE user_id = ?');
   const budgets = budgetStmt.all(req.userId);
-  
+
   const billSpentStmt = db.prepare(`
     SELECT category, SUM(ABS(amount)) as spent
     FROM bills
@@ -527,9 +602,9 @@ app.get('/api/export/pdf', authMiddleware, async (req, res) => {
     GROUP BY category
   `);
   const spent = billSpentStmt.all(req.userId, startDate, endDate);
-  
-  const pdfContent = generatePDFContent(bills, budgets, spent, currentMonth);
-  
+
+  const pdfContent = generatePDFContent(decryptedBills, budgets, spent, currentMonth);
+
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `attachment; filename=bill-report-${currentMonth}.pdf`);
   res.send(pdfContent);
@@ -537,11 +612,11 @@ app.get('/api/export/pdf', authMiddleware, async (req, res) => {
 
 function generatePDFContent(bills, budgets, spent, month) {
   let content = `账单报告 - ${month}\n`;
-  content += '=' .repeat(50) + '\n\n';
-  
+  content += '='.repeat(50) + '\n\n';
+
   const spentMap = {};
   spent.forEach(s => spentMap[s.category] = s.spent);
-  
+
   content += '预算状态:\n';
   content += '-'.repeat(30) + '\n';
   budgets.forEach(b => {
@@ -549,13 +624,13 @@ function generatePDFContent(bills, budgets, spent, month) {
     const status = s > b.amount ? '超限!' : '正常';
     content += `${b.category}: 已花费 ${s.toFixed(2)} / ${b.amount.toFixed(2)} [${status}]\n`;
   });
-  
+
   content += '\n\n账单明细:\n';
   content += '-'.repeat(30) + '\n';
   bills.forEach(b => {
     content += `${b.date} | ${b.category} | ${b.amount.toFixed(2)} | ${b.description}\n`;
   });
-  
+
   return content;
 }
 
