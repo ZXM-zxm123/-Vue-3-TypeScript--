@@ -37,10 +37,14 @@
         </el-aside>
         <el-main>
           <div class="bills-content">
+            <!-- 筛选和操作栏 -->
             <el-row :gutter="20" class="toolbar">
               <el-col :span="20">
                 <el-button type="primary" @click="showAddDialog = true">添加账单</el-button>
                 <el-button @click="showUploadDialog = true">CSV导入</el-button>
+                
+                <el-divider direction="vertical" />
+                
                 <el-date-picker
                   v-model="dateRange"
                   type="daterange"
@@ -48,10 +52,28 @@
                   start-placeholder="开始日期"
                   end-placeholder="结束日期"
                   @change="loadBills"
-                  style="margin-left: 10px;"
+                  style="width: 300px;"
                 />
-                <el-select v-model="filterCategory" placeholder="选择类别" clearable @change="loadBills" style="margin-left: 10px; width: 150px;">
+                
+                <el-select
+                  v-model="filterCategory"
+                  placeholder="选择类别"
+                  clearable
+                  @change="loadBills"
+                  style="width: 130px; margin-left: 10px;"
+                >
                   <el-option v-for="cat in categories" :key="cat" :label="cat" :value="cat" />
+                </el-select>
+                
+                <el-select
+                  v-model="pageSize"
+                  placeholder="每页显示"
+                  @change="loadBills"
+                  style="width: 120px; margin-left: 10px;"
+                >
+                  <el-option label="20条" :value="20" />
+                  <el-option label="50条" :value="50" />
+                  <el-option label="100条" :value="100" />
                 </el-select>
               </el-col>
               <el-col :span="4" style="text-align: right;">
@@ -59,17 +81,33 @@
               </el-col>
             </el-row>
 
-            <el-table :data="bills" style="width: 100%; margin-top: 20px;" stripe>
-              <el-table-column prop="date" label="日期" width="120" />
-              <el-table-column prop="category" label="类别" width="100">
+            <!-- 统计信息 -->
+            <el-row :gutter="20" style="margin-bottom: 15px;">
+              <el-col :span="24">
+                <div class="page-info">
+                  共 {{ total }} 条账单，当前显示第 {{ (currentPage - 1) * pageSize + 1 }} - {{ Math.min(currentPage * pageSize, total) }} 条
+                </div>
+              </el-col>
+            </el-row>
+
+            <!-- 账单列表 -->
+            <el-table
+              v-loading="loading"
+              :data="bills"
+              style="width: 100%;"
+              stripe
+              border
+            >
+              <el-table-column prop="date" label="日期" width="120" sortable />
+              <el-table-column prop="category" label="类别" width="120">
                 <template #default="{ row }">
                   <el-tag size="small">{{ row.category }}</el-tag>
                 </template>
               </el-table-column>
               <el-table-column prop="description" label="描述" />
-              <el-table-column label="金额" width="120">
+              <el-table-column label="金额" width="140">
                 <template #default="{ row }">
-                  <span :style="{ color: row.amount < 0 ? '#ff4949' : '#67c23a' }">
+                  <span :style="{ color: row.amount < 0 ? '#ff4949' : '#67c23a', fontWeight: 'bold' }">
                     {{ row.amount < 0 ? '-' : '+' }}¥{{ Math.abs(row.amount).toFixed(2) }}
                   </span>
                 </template>
@@ -81,21 +119,41 @@
               </el-table-column>
               <el-table-column label="操作" width="100">
                 <template #default="{ row }">
-                  <el-button size="small" type="danger" @click="handleDelete(row.id)">删除</el-button>
+                  <el-button
+                    type="danger"
+                    size="small"
+                    @click="handleDelete(row.id)"
+                  >
+                    删除
+                  </el-button>
                 </template>
               </el-table-column>
             </el-table>
 
-            <el-empty v-if="bills.length === 0" description="暂无账单" />
+            <!-- 分页组件 -->
+            <div class="pagination-wrapper">
+              <el-pagination
+                v-model:current-page="currentPage"
+                v-model:page-size="pageSize"
+                :total="total"
+                :page-sizes="[20, 50, 100]"
+                layout="total, sizes, prev, pager, next, jumper"
+                @size-change="handleSizeChange"
+                @current-change="handleCurrentChange"
+              />
+            </div>
+
+            <el-empty v-if="bills.length === 0 && !loading" description="暂无账单" />
           </div>
         </el-main>
       </el-container>
     </el-container>
 
+    <!-- 添加账单对话框 -->
     <el-dialog v-model="showAddDialog" title="添加账单" width="500px">
       <el-form :model="billForm" label-width="100px">
         <el-form-item label="金额">
-          <el-input-number v-model="billForm.amount" :precision="2" :step="100" />
+          <el-input-number v-model="billForm.amount" :precision="2" :step="100" style="width: 150px;" />
           <el-radio-group v-model="billForm.type" style="margin-left: 10px;">
             <el-radio label="expense">支出</el-radio>
             <el-radio label="income">收入</el-radio>
@@ -105,25 +163,32 @@
           <el-input v-model="billForm.description" placeholder="输入交易描述" />
         </el-form-item>
         <el-form-item label="类别">
-          <el-select v-model="billForm.category" placeholder="选择类别">
+          <el-select v-model="billForm.category" placeholder="选择类别" style="width: 200px;">
             <el-option v-for="cat in categories" :key="cat" :label="cat" :value="cat" />
           </el-select>
         </el-form-item>
         <el-form-item label="日期">
-          <el-date-picker v-model="billForm.date" type="date" placeholder="选择日期" value-format="YYYY-MM-DD" />
+          <el-date-picker
+            v-model="billForm.date"
+            type="date"
+            placeholder="选择日期"
+            value-format="YYYY-MM-DD"
+            style="width: 200px;"
+          />
         </el-form-item>
         <el-form-item label="账户">
-          <el-select v-model="billForm.accountId" placeholder="选择账户">
+          <el-select v-model="billForm.accountId" placeholder="选择账户" style="width: 200px;">
             <el-option v-for="acc in accounts" :key="acc.id" :label="acc.name" :value="acc.id" />
           </el-select>
         </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="showAddDialog = false">取消</el-button>
-        <el-button type="primary" @click="handleAddBill">确定</el-button>
+        <el-button type="primary" @click="handleAddBill" :loading="addLoading">确定</el-button>
       </template>
     </el-dialog>
 
+    <!-- CSV上传对话框 -->
     <el-dialog v-model="showUploadDialog" title="CSV导入" width="500px">
       <el-upload
         ref="uploadRef"
@@ -135,13 +200,23 @@
         <el-button>选择CSV文件</el-button>
         <template #tip>
           <div class="el-upload__tip">
-            CSV格式：amount,description,date,accountId,category(可选)
+            CSV格式：amount, description, date, accountId, category(可选)
           </div>
         </template>
       </el-upload>
+      <div v-if="uploadFile" class="file-info">
+        <el-tag type="success">已选择：{{ uploadFile.name }}</el-tag>
+      </div>
       <template #footer>
-        <el-button @click="showUploadDialog = false">取消</el-button>
-        <el-button type="primary" @click="handleUpload" :disabled="!uploadFile">导入</el-button>
+        <el-button @click="showUploadDialog = false; uploadFile = null;">取消</el-button>
+        <el-button
+          type="primary"
+          @click="handleUpload"
+          :disabled="!uploadFile"
+          :loading="uploadLoading"
+        >
+          导入
+        </el-button>
       </template>
     </el-dialog>
   </div>
@@ -152,7 +227,7 @@ import { ref, reactive, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import type { UploadFile } from 'element-plus';
-import type { Bill, Account } from '../types';
+import type { Bill, Account, PaginatedBillsResponse } from '../types';
 import { billAPI, accountAPI, exportAPI } from '../utils/api';
 import { HomeFilled, Money, Wallet, DataLine, Setting } from '@element-plus/icons-vue';
 
@@ -162,8 +237,15 @@ const activeMenu = ref('/bills');
 
 const bills = ref<Bill[]>([]);
 const accounts = ref<Account[]>([]);
+const loading = ref(false);
+const addLoading = ref(false);
+const uploadLoading = ref(false);
+
 const dateRange = ref<[string, string] | null>(null);
 const filterCategory = ref('');
+const currentPage = ref(1);
+const pageSize = ref(50);
+const total = ref(0);
 
 const showAddDialog = ref(false);
 const showUploadDialog = ref(false);
@@ -180,28 +262,35 @@ const billForm = reactive({
   accountId: 1
 });
 
-onMounted(async () => {
-  await loadAccounts();
-  await loadBills();
-});
-
+// 加载账单
 const loadBills = async () => {
+  loading.value = true;
   try {
-    const params: any = {};
+    const params: any = {
+      page: currentPage.value,
+      limit: pageSize.value
+    };
+    
     if (dateRange.value) {
       params.startDate = dateRange.value[0];
       params.endDate = dateRange.value[1];
     }
+    
     if (filterCategory.value) {
       params.category = filterCategory.value;
     }
+    
     const { data } = await billAPI.getAll(params);
-    bills.value = data;
+    bills.value = data.bills;
+    total.value = data.total;
   } catch (error) {
     ElMessage.error('加载账单失败');
+  } finally {
+    loading.value = false;
   }
 };
 
+// 加载账户
 const loadAccounts = async () => {
   try {
     const { data } = await accountAPI.getAll();
@@ -214,12 +303,20 @@ const loadAccounts = async () => {
   }
 };
 
+// 获取账户名称
 const getAccountName = (accountId: number) => {
   const account = accounts.value.find(a => a.id === accountId);
   return account?.name || '未知账户';
 };
 
+// 添加账单
 const handleAddBill = async () => {
+  if (!billForm.description) {
+    ElMessage.warning('请输入描述');
+    return;
+  }
+  
+  addLoading.value = true;
   try {
     const amount = billForm.type === 'expense' ? -Math.abs(billForm.amount) : Math.abs(billForm.amount);
     await billAPI.create({
@@ -229,20 +326,25 @@ const handleAddBill = async () => {
       date: billForm.date,
       accountId: billForm.accountId
     });
+    
     ElMessage.success('添加成功');
     showAddDialog.value = false;
     await loadBills();
     await loadAccounts();
   } catch (error) {
     ElMessage.error('添加失败');
+  } finally {
+    addLoading.value = false;
   }
 };
 
+// 删除账单
 const handleDelete = async (id: number) => {
   try {
     await ElMessageBox.confirm('确定删除这条账单吗？', '提示', {
       type: 'warning'
     });
+    
     await billAPI.delete(id);
     ElMessage.success('删除成功');
     await loadBills();
@@ -253,16 +355,19 @@ const handleDelete = async (id: number) => {
   }
 };
 
+// 文件选择
 const handleFileChange = (file: UploadFile) => {
   uploadFile.value = file;
 };
 
+// 上传文件
 const handleUpload = async () => {
-  if (!uploadFile.value) return;
-
+  if (!uploadFile.value?.raw) return;
+  
+  uploadLoading.value = true;
   const formData = new FormData();
-  formData.append('file', uploadFile.value.raw!);
-
+  formData.append('file', uploadFile.value.raw);
+  
   try {
     const { data } = await billAPI.upload(formData);
     ElMessage.success(`成功导入 ${data.uploaded} 条账单`);
@@ -272,9 +377,12 @@ const handleUpload = async () => {
     await loadAccounts();
   } catch (error) {
     ElMessage.error('导入失败');
+  } finally {
+    uploadLoading.value = false;
   }
 };
 
+// 导出PDF
 const handleExport = async () => {
   try {
     const { data } = await exportAPI.exportPDF();
@@ -291,11 +399,28 @@ const handleExport = async () => {
   }
 };
 
+// 页面大小变更
+const handleSizeChange = (val: number) => {
+  pageSize.value = val;
+  loadBills();
+};
+
+// 当前页变更
+const handleCurrentChange = (val: number) => {
+  currentPage.value = val;
+  loadBills();
+};
+
+// 退出登录
 const handleLogout = () => {
   localStorage.removeItem('token');
   localStorage.removeItem('username');
   router.push('/login');
 };
+
+onMounted(async () => {
+  await Promise.all([loadBills(), loadAccounts()]);
+});
 </script>
 
 <style scoped>
@@ -336,6 +461,26 @@ const handleLogout = () => {
 }
 
 .toolbar {
-  margin-bottom: 10px;
+  margin-bottom: 15px;
+}
+
+.page-info {
+  background: white;
+  padding: 12px 20px;
+  border-radius: 6px;
+  color: #666;
+}
+
+.pagination-wrapper {
+  display: flex;
+  justify-content: center;
+  margin-top: 20px;
+  padding: 15px;
+  background: white;
+  border-radius: 6px;
+}
+
+.file-info {
+  margin-top: 10px;
 }
 </style>

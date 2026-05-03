@@ -59,5 +59,53 @@ export interface DashboardData {
   categoryData: CategoryData[];
   dailyData: DailyData[];
   accounts: Account[];
+  budgetStatus: BudgetStatus[];
   currentMonth: string;
+}
+
+// ===== 新增的统计类型 =====
+
+export interface CategorySummaryItem {
+  category: string;
+  expense: number;
+  income: number;
+  count: number;
+}
+
+export interface CategorySummaryResponse {
+  month: string;
+  data: CategorySummaryItem[];
+}
+
+export interface DailySummaryItem {
+  date: string;
+  expense: number;
+  income: number;
+  count: number;
+}
+
+export interface DailySummaryResponse {
+  month: string;
+  data: DailySummaryItem[];
+}
+
+export interface MonthlyTrendItem {
+  month: string;
+  expense: number;
+  income: number;
+}
+
+export interface MonthlyTrendResponse {
+  year: number;
+  data: MonthlyTrendItem[];
+}
+
+// ===== 分页类型 =====
+
+export interface PaginatedBillsResponse {
+  bills: Bill[];
+  total: number;
+  page: number;
+  limit: number;
+  totalPages: number;
 }
